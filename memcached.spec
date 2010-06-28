@@ -1,7 +1,7 @@
 Name:           memcached
-Version:        1.2.8
+Version:        1.2.8.tags
 Release:        1%{?dist}
-Summary:        High Performance, Distributed Memory Object Cache
+Summary:        High Performance, Distributed Memory Object Cache with tags support
 
 Group:          System Environment/Daemons
 License:        BSD

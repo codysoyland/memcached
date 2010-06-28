@@ -64,6 +64,11 @@ static pthread_mutex_t stats_lock;
 static CQ_ITEM *cqi_freelist;
 static pthread_mutex_t cqi_freelist_lock;
 
+//tag related
+/* Lock for tag */
+static pthread_mutex_t tag_lock;
+//tag related
+
 /*
  * Each libevent instance has a wakeup pipe, which other threads
  * can use to signal that they've put a new connection on its queue.
@@ -545,6 +550,17 @@ void mt_item_flush_expired() {
 }
 
 /*
+ * Flushes items by tags
+ */
+int mt_item_flush_by_tags(const char *tags[], const size_t *ntags[], const uint8_t n) {
+		int items_deleted;
+    pthread_mutex_lock(&cache_lock);
+    items_deleted = do_item_flush_by_tags(tags, ntags, n);
+    pthread_mutex_unlock(&cache_lock);
+		return items_deleted;
+}
+
+/*
  * Dumps part of the cache
  */
 char *mt_item_cachedump(unsigned int slabs_clsid, unsigned int limit, unsigned int *bytes) {
@@ -655,6 +671,8 @@ void thread_init(int nthreads, struct event_base *main_base) {
     pthread_mutex_init(&cqi_freelist_lock, NULL);
     cqi_freelist = NULL;
 
+    pthread_mutex_init(&tag_lock, NULL);       //tag related
+
     threads = calloc(nthreads, sizeof(LIBEVENT_THREAD));
     if (! threads) {
         perror("Can't allocate thread descriptors");
@@ -690,5 +708,61 @@ void thread_init(int nthreads, struct event_base *main_base) {
     }
     pthread_mutex_unlock(&init_lock);
 }
+
+//tag related
+/******************************* TAG ******************************/
+int mt_tag_insert(char *tag_name, const size_t ntag, char *key_name, const size_t nkey) {
+    int ret = 0;
+
+    pthread_mutex_lock(&tag_lock);
+    ret = do_tag_insert(tag_name, ntag, key_name, nkey);
+    pthread_mutex_unlock(&tag_lock);
+    return ret;
+}
+
+bool mt_tag_delete(const char *tag_name, const size_t ntag) {
+    bool ret = false;
+ 
+    pthread_mutex_lock(&tag_lock);
+    ret = do_tag_delete(tag_name, ntag);
+    pthread_mutex_unlock(&tag_lock);
+    return ret;
+}
+
+bool mt_tags_delete(const char *tags[], const uint8_t *ntags[], const uint8_t n) {
+    bool ret = false;
+    int ndelete = 0;
+ 
+    pthread_mutex_lock(&tag_lock);
+    ndelete = do_tags_delete(tags, ntags, n);
+    if (ndelete) ret = true;
+    pthread_mutex_unlock(&tag_lock);
+    return ret;
+}
+
+tag* mt_tag_find(const char *tag_name, const size_t ntag) {
+    tag* ret = NULL;
+
+    pthread_mutex_lock(&tag_lock);
+    ret = do_tag_find(tag_name, ntag);
+    pthread_mutex_unlock(&tag_lock);
+    return ret;
+}
+
+char* mt_tag_dump(int *len) {
+    char* ret = NULL;
+
+    pthread_mutex_lock(&tag_lock);
+    ret = do_tag_dump(len);
+    pthread_mutex_unlock(&tag_lock);
+    return ret;
+}
+
+void mt_tag_reverse_del_key(splay_tree *tags_tree, snode* key_sn) {
+    pthread_mutex_lock(&tag_lock);
+    do_tag_reverse_del_key(tags_tree, key_sn);
+    pthread_mutex_unlock(&tag_lock);
+}
+//tag related
 
 #endif

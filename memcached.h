@@ -57,6 +57,8 @@
 # include <unistd.h>
 #endif
 
+#include "splaytree.h"
+
 /** Time relative to server start. Smaller than time_t on 64-bit systems. */
 typedef unsigned int rel_time_t;
 
@@ -71,7 +73,10 @@ struct stats {
     uint64_t      set_cmds;
     uint64_t      get_hits;
     uint64_t      get_misses;
-    uint64_t      flush_cmds;
+	uint64_t      flush_cmds;
+    uint64_t      tag_add_cmds;     //tag related
+    uint64_t      tag_delete_cmds;  //tag related
+    uint64_t      tags_delete_cmds; //tag related
     uint64_t      evictions;
     time_t        started;          /* when the process was started */
     uint64_t      bytes_read;
@@ -100,11 +105,36 @@ struct settings {
     int detail_enabled;     /* nonzero if we're collecting detailed stats */
     int reqs_per_event;     /* Maximum number of io to process on each
                                io-event. */
+    bool is_ignore_empty;   /* is ignore key with empty value */
     int backlog;
 };
 
 extern struct stats stats;
 extern struct settings settings;
+
+//tag related
+typedef struct _str_node {
+    struct _str_node   *next;
+    uint8_t            nstr;     /* length of key or tag */
+    char               unused[3];
+    void * end[];
+    /* then null-terminated key */
+} snode;
+
+#define GET_name(snode) ((char*)&((snode)->end[0]))
+
+typedef struct _strtag {
+    splay_tree         *keys;     /* key */
+    struct _strtag     *h_next;   /* hash chain next */
+    bool               is_deling; /* is deleting */
+    uint8_t            ntag;      /* length of tag */
+    char               unused[2];
+    void * end[];
+    /* then null-terminated tag */
+} tag;
+
+#define TAG_name(tag) ((char*)&((tag)->end[0]))
+//tag related
 
 #define ITEM_LINKED 1
 #define ITEM_DELETED 2
@@ -116,6 +146,7 @@ typedef struct _stritem {
     struct _stritem *next;
     struct _stritem *prev;
     struct _stritem *h_next;    /* hash chain next */
+    splay_tree      *tags;      /* the tags include the item -- tag related */
     rel_time_t      time;       /* least recent access */
     rel_time_t      exptime;    /* expire time */
     int             nbytes;     /* size of data */
@@ -251,6 +282,7 @@ conn *conn_new(const int sfd, const int init_state, const int event_flags, const
 #include "assoc.h"
 #include "items.h"
 #include "memcached_dtrace.h"
+#include "tag.h"
 
 /*
  * In multithreaded mode, we wrap certain functions with lock management and
@@ -285,6 +317,7 @@ int   mt_is_listen_thread(void);
 item *mt_item_alloc(char *key, size_t nkey, int flags, rel_time_t exptime, int nbytes);
 char *mt_item_cachedump(const unsigned int slabs_clsid, const unsigned int limit, unsigned int *bytes);
 void  mt_item_flush_expired(void);
+int   mt_item_flush_by_tags(const char *tags[], const size_t *ntags[], const uint8_t n);
 item *mt_item_get_notedeleted(const char *key, const size_t nkey, bool *delete_locked);
 int   mt_item_link(item *it);
 void  mt_item_remove(item *it);
@@ -315,6 +348,7 @@ int   mt_store_item(item *item, int comm);
 # define item_alloc(x,y,z,a,b)       mt_item_alloc(x,y,z,a,b)
 # define item_cachedump(x,y,z)       mt_item_cachedump(x,y,z)
 # define item_flush_expired()        mt_item_flush_expired()
+# define item_flush_by_tags(x,y,z)   mt_item_flush_by_tags(x,y,z)
 # define item_get_notedeleted(x,y,z) mt_item_get_notedeleted(x,y,z)
 # define item_link(x)                mt_item_link(x)
 # define item_remove(x)              mt_item_remove(x)
@@ -329,6 +363,14 @@ int   mt_store_item(item *item, int comm);
 # define slabs_reassign(x,y)         mt_slabs_reassign(x,y)
 # define slabs_stats(x)              mt_slabs_stats(x)
 # define store_item(x,y)             mt_store_item(x,y)
+//tag related
+# define tag_insert(x,y,z,a)         mt_tag_insert(x,y,z,a)
+# define tag_delete(x,y)             mt_tag_delete(x,y)
+# define tags_delete(x,y,z)          mt_tags_delete(x,y,z)
+# define tag_find(x,y)               mt_tag_find(x,y)
+# define tag_dump(x)                 mt_tag_dump(x)
+# define tag_reverse_del_key(x,y)    mt_tag_reverse_del_key(x,y)
+//tag related
 
 # define STATS_LOCK()                mt_stats_lock()
 # define STATS_UNLOCK()              mt_stats_unlock()
@@ -349,6 +391,7 @@ int   mt_store_item(item *item, int comm);
 # define item_alloc(x,y,z,a,b)       do_item_alloc(x,y,z,a,b)
 # define item_cachedump(x,y,z)       do_item_cachedump(x,y,z)
 # define item_flush_expired()        do_item_flush_expired()
+# define item_flush_by_tags(x,y,z)   do_item_flush_by_tags(x,y,z)
 # define item_get_notedeleted(x,y,z) do_item_get_notedeleted(x,y,z)
 # define item_link(x)                do_item_link(x)
 # define item_remove(x)              do_item_remove(x)
@@ -364,6 +407,14 @@ int   mt_store_item(item *item, int comm);
 # define slabs_stats(x)              do_slabs_stats(x)
 # define store_item(x,y)             do_store_item(x,y)
 # define thread_init(x,y)            0
+//tag related
+# define tag_insert(x,y,z,a)         do_tag_insert(x,y,z,a)
+# define tag_delete(x,y)             do_tag_delete(x,y)
+# define tags_delete(x,y,z)          do_tags_delete(x,y,z)
+# define tag_find(x,y)               do_tag_find(x,y)
+# define tag_dump(x)                 do_tag_dump(x)
+# define tag_reverse_del_key(x,y)    do_tag_reverse_del_key(x,y)
+//tag related
 
 # define STATS_LOCK()                /**/
 # define STATS_UNLOCK()              /**/

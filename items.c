@@ -13,6 +13,7 @@
 #include <string.h>
 #include <time.h>
 #include <assert.h>
+#include "splaytree.h"
 
 /* Forward Declarations */
 static void item_link_q(item *it);
@@ -91,6 +92,8 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags, const rel_tim
     item *it;
     char suffix[40];
     size_t ntotal = item_make_header(nkey + 1, flags, nbytes, suffix, &nsuffix);
+    snode *key_sn = NULL;
+    int size = 0;
 
     unsigned int id = slabs_clsid(ntotal);
     if (id == 0)
@@ -131,6 +134,21 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags, const rel_tim
                     stats.evictions++;
                     STATS_UNLOCK();
                 }
+                //tag related
+                //reverse delete key
+                size = sizeof(snode) + search->nkey + 1;
+                key_sn = calloc(1, size);
+                if (NULL == key_sn) {
+                    fprintf(stderr, "SERVER_ERROR out of memory");
+                    return;
+                }
+                key_sn->nstr = search->nkey;
+                strncpy(GET_name(key_sn), ITEM_key(search), search->nkey);
+                GET_name(key_sn)[search->nkey] = '\0';      /* because strncpy() sucks */
+                tag_reverse_del_key(search->tags, key_sn);
+                free(key_sn);
+                key_sn = NULL;
+                //tag related
                 do_item_unlink(search);
                 break;
             }
@@ -167,7 +185,7 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags, const rel_tim
 
     assert(it != heads[it->slabs_clsid]);
 
-    it->next = it->prev = it->h_next = 0;
+    it->next = it->prev = it->h_next = it->tags = 0;
     it->refcount = 1;     /* the caller will have a reference */
     DEBUG_REFCNT(it, '*');
     it->it_flags = 0;
@@ -543,4 +561,62 @@ void do_item_flush_expired(void) {
             }
         }
     }
+}
+
+
+int do_item_flush_by_tags(const char *tags[], const size_t *ntags[], const uint8_t n) {
+
+	//fprintf(stderr, "do_item_flush_by_tags!!! \n");
+
+	int i, k = 0, size = 0;
+    long long hv = 0;
+    item *iter, *next;
+    snode *key_sn = NULL;
+
+    for (i = 0; i < LARGEST_ID; i++) {
+        for (iter = heads[i]; iter != NULL; iter = next) {
+            if (iter->time >= settings.oldest_live) {
+                next = iter->next;
+
+                //fprintf(stderr, "FOUND item %s \n", ITEM_key(iter));
+                
+                uint8_t j;
+            	bool item_has_all_tags = true;
+            	
+            	for (j=0; j<n && item_has_all_tags; j++) {
+                    hv = hash(tags[j], ntags[j], 0);
+                    item_has_all_tags = splaytree_find(iter->tags, hv);
+            	}
+
+            	if (item_has_all_tags) {
+
+            		iter->refcount++;
+            		size = sizeof(snode) + iter->nkey + 1;
+                    key_sn = calloc(1, size);
+                    if (NULL == key_sn) {
+                        fprintf(stderr, "SERVER_ERROR out of memory");
+                        return;
+                    }
+
+                    key_sn->nstr = iter->nkey;
+                    strncpy(GET_name(key_sn), ITEM_key(iter), iter->nkey);
+                    GET_name(key_sn)[iter->nkey] = '\0';      /* because strncpy() sucks */
+                    tag_reverse_del_key(iter->tags, key_sn);
+                    free(key_sn);
+                    key_sn = NULL;
+                    
+                    //delete item
+                    item_unlink(iter);
+                    item_remove(iter);      // release our reference
+                    k++;
+            	}
+            	
+            } else {
+                /* We've hit the first old item. Continue to the next queue. */
+                break;
+            }
+        }
+    }
+    
+    return k;
 }

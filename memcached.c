@@ -143,6 +143,7 @@ static void stats_init(void) {
     stats.curr_bytes = stats.bytes_read = stats.bytes_written = stats.flush_cmds = 0;
     stats.listen_disabled_num = 0;
     stats.accepting_conns = 1; /* assuming we start in this state. */
+    stats.tag_add_cmds = stats.tag_delete_cmds = stats.tags_delete_cmds = 0;
 
     /* make the time we started always be 2 seconds before we really
        did, so time(0) - time.started is never zero.  if so, things
@@ -158,6 +159,7 @@ static void stats_reset(void) {
     stats.get_cmds = stats.set_cmds = stats.get_hits = stats.get_misses = stats.evictions = 0;
     stats.bytes_read = stats.bytes_written = 0;
     stats.flush_cmds = stats.listen_disabled_num = 0;
+    stats.tag_add_cmds = stats.tag_delete_cmds = stats.tags_delete_cmds = 0;
     stats_prefix_clear();
     STATS_UNLOCK();
 }
@@ -184,6 +186,7 @@ static void settings_init(void) {
     settings.num_threads++;  /* N workers + 1 dispatcher */
     settings.prefix_delimiter = ':';
     settings.detail_enabled = 0;
+	settings.is_ignore_empty = true;	//tag related
     settings.reqs_per_event = 20;
     settings.backlog = 1024;
 }
@@ -779,6 +782,8 @@ static void complete_nread(conn *c) {
     item *it = c->item;
     int comm = c->item_comm;
     int ret;
+    int length = -1;
+    int flag = -1;
 
     STATS_LOCK();
     stats.set_cmds++;
@@ -788,8 +793,21 @@ static void complete_nread(conn *c) {
         out_string(c, "CLIENT_ERROR bad data chunk");
     } else {
       ret = store_item(it, comm);
+      //tag related
       if (ret == 1) {
-          out_string(c, "STORED");
+          sscanf(ITEM_suffix(it), " %d %d", &flag, &length);
+          if (0 == length && true == settings.is_ignore_empty) {
+              STATS_LOCK();
+              stats.set_cmds--;
+              STATS_UNLOCK();
+
+              item_unlink(c->item);         //not store empty key
+
+              out_string(c, "NOT_STORED");
+          }
+          else {
+              out_string(c, "STORED");
+              
 #ifdef HAVE_DTRACE
           switch (comm) {
           case NREAD_ADD:
@@ -813,7 +831,11 @@ static void complete_nread(conn *c) {
               break;
           }
 #endif
-      } else if(ret == 2)
+          
+          }
+      }
+      //tag related
+      else if(ret == 2)
           out_string(c, "EXISTS");
       else if(ret == 3)
           out_string(c, "NOT_FOUND");
@@ -937,6 +959,7 @@ typedef struct token_s {
 #define COMMAND_TOKEN 0
 #define SUBCOMMAND_TOKEN 1
 #define KEY_TOKEN 1
+#define TAG_BEGINKEY_TOKEN 2
 #define KEY_MAX_LENGTH 250
 
 #define MAX_TOKENS 8
@@ -1042,8 +1065,13 @@ inline static void process_stats_detail(conn *c, const char *command) {
         char *stats = stats_prefix_dump(&len);
         write_and_free(c, stats, len);
     }
+    else if (strcmp(command, "tag_dump") == 0) {
+        int len;
+        char *stats = tag_dump(&len);
+        write_and_free(c, stats, len);
+    }
     else {
-        out_string(c, "CLIENT_ERROR usage: stats detail on|off|dump");
+        out_string(c, "CLIENT_ERROR usage: stats detail on|off|dump|tag_dump");
     }
 }
 
@@ -1092,6 +1120,9 @@ static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
         pos += sprintf(pos, "STAT cmd_set %llu\r\n", stats.set_cmds);
         pos += sprintf(pos, "STAT get_hits %llu\r\n", stats.get_hits);
         pos += sprintf(pos, "STAT get_misses %llu\r\n", stats.get_misses);
+        pos += sprintf(pos, "STAT cmd_tag_add %llu\r\n", stats.tag_add_cmds);       //tag related
+        pos += sprintf(pos, "STAT cmd_tag_delete %llu\r\n", stats.tag_delete_cmds); //tag related
+        pos += sprintf(pos, "STAT cmd_tags_delete %llu\r\n", stats.tags_delete_cmds); //tag related
         pos += sprintf(pos, "STAT evictions %llu\r\n", stats.evictions);
         pos += sprintf(pos, "STAT bytes_read %llu\r\n", stats.bytes_read);
         pos += sprintf(pos, "STAT bytes_written %llu\r\n", stats.bytes_written);
@@ -1439,6 +1470,62 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
     conn_set_state(c, conn_nread);
 }
 
+//tag related
+static void process_tag_add_command(conn *c, token_t *tokens, const size_t ntokens) {
+    char *tag_name = NULL;
+    size_t ntag = 0;
+    char *key_name = NULL;
+    size_t nkey = 0;
+    token_t *key_token = NULL;
+    int ret = 0;
+
+    assert(c != NULL && tokens != NULL);
+
+    tag_name = tokens[KEY_TOKEN].value;
+    ntag = tokens[KEY_TOKEN].length;
+    if (ntag > KEY_MAX_LENGTH) {
+        out_string(c, "CLIENT_ERROR bad command line format");
+        return;
+    }
+
+    STATS_LOCK();
+    stats.tag_add_cmds++;
+    STATS_UNLOCK();
+
+    key_token = &tokens[TAG_BEGINKEY_TOKEN];
+    do {
+        for(; key_token->length != 0; key_token++) {
+            key_name = key_token->value;
+            nkey = key_token->length;
+
+            if (nkey > KEY_MAX_LENGTH || ntag > KEY_MAX_LENGTH) {
+                out_string(c, "CLIENT_ERROR bad command line format");
+                return;
+            }
+
+            ret = tag_insert(tag_name, ntag, key_name, nkey);
+            if (0 == ret) {
+                out_string(c, "SERVER_ERROR out of memory or param error");
+                return;
+            }
+        }
+
+        /*
+         * If the command string hasn't been fully processed, get the next set
+         * of tokens.
+         */
+        if(key_token->value != NULL) {
+            tokenize_command(key_token->value, tokens, MAX_TOKENS);
+            key_token = tokens;
+        }
+
+    } while(key_token->value != NULL);
+
+    out_string(c, "TAG_STORED");
+    return;
+}
+//tag related
+
 static void process_arithmetic_command(conn *c, token_t *tokens, const size_t ntokens, const bool incr) {
     char temp[sizeof("18446744073709551615")];
     item *it;
@@ -1537,6 +1624,8 @@ static void process_delete_command(conn *c, token_t *tokens, const size_t ntoken
     size_t nkey;
     item *it;
     time_t exptime = 0;
+    snode *ptag = NULL, *pnext = NULL, *key_sn = NULL;
+    int size = 0;
 
     assert(c != NULL);
 
@@ -1566,6 +1655,23 @@ static void process_delete_command(conn *c, token_t *tokens, const size_t ntoken
     it = item_get(key, nkey);
     if (it) {
         MEMCACHED_COMMAND_DELETE(c->sfd, ITEM_key(it), exptime);
+        //tag related
+        //reverse delete key
+        size = sizeof(snode) + nkey + 1;
+        key_sn = calloc(1, size);
+        if (NULL == key_sn) {
+            fprintf(stderr, "SERVER_ERROR out of memory");
+            return;
+        }
+
+        key_sn->nstr = nkey;
+        strncpy(GET_name(key_sn), key, nkey);
+        GET_name(key_sn)[nkey] = '\0';      /* because strncpy() sucks */
+        tag_reverse_del_key(it->tags, key_sn);
+        free(key_sn);
+        key_sn = NULL;
+        //tag related
+
         if (exptime == 0) {
             item_unlink(it);
             item_remove(it);      /* release our reference */
@@ -1578,6 +1684,85 @@ static void process_delete_command(conn *c, token_t *tokens, const size_t ntoken
         out_string(c, "NOT_FOUND");
     }
 }
+
+//tag related
+static void process_tag_delete_command(conn *c, token_t *tokens, const size_t ntokens) {
+    char *tag_name = NULL;
+    size_t ntag = 0;
+
+    assert(c != NULL && tokens != NULL);
+
+    tag_name = tokens[KEY_TOKEN].value;
+    ntag = tokens[KEY_TOKEN].length;
+    if(ntag > KEY_MAX_LENGTH) {
+        out_string(c, "CLIENT_ERROR bad command line format");
+        return;
+    }
+
+    STATS_LOCK();
+    stats.tag_delete_cmds++;
+    STATS_UNLOCK();
+
+    if (true == tag_delete(tag_name, ntag)) {
+        out_string(c, "TAG_DELETED");
+    }
+    else {
+        out_string(c, "TAG_NOT_FOUND");
+    }
+
+    return;
+}
+
+/*
+ * Delete items by several tags at once, 
+ *
+ * only items which has all of these tags are deleted
+ */
+static inline void process_tags_delete_command(conn *c, token_t *tokens, size_t ntokens) {
+
+	char *tags[ntokens];
+	size_t *ntags[ntokens];
+    token_t *tag_token = &tokens[KEY_TOKEN];
+    uint8_t i = 0;
+    int ndelete;
+    
+    do {
+        while(tag_token->length != 0) {
+        	tags[i] = tag_token->value;
+        	ntags[i] = tag_token->length;
+        	i++;
+        	tag_token++;
+        }
+
+        /*
+         * If the command string hasn't been fully processed, get the next set
+         * of tokens.
+         */
+        if(tag_token->value != NULL) {
+            ntokens = tokenize_command(tag_token->value, tokens, MAX_TOKENS);
+            tag_token = tokens;
+        }
+
+    } while(tag_token->value != NULL);        	
+    
+    STATS_LOCK();
+    stats.tags_delete_cmds++;
+    STATS_UNLOCK();
+
+    ndelete = item_flush_by_tags(tags, ntags, i);
+    if (ndelete > 0) {
+        char temp[1024];
+        char *msg = temp;    	
+    	msg += sprintf(msg, "%d ITEMS_DELETED", ndelete);
+        out_string(c, temp);
+    }
+    else {
+        out_string(c, "NO_ITEMS_FOUND");
+    }
+
+    return;
+}
+//tag related
 
 /*
  * Adds an item to the deferred-delete list so it can be reaped later.
@@ -1765,6 +1950,20 @@ static void process_command(conn *c, char *command) {
 #endif
     } else if ((ntokens == 3 || ntokens == 4) && (strcmp(tokens[COMMAND_TOKEN].value, "verbosity") == 0)) {
         process_verbosity_command(c, tokens, ntokens);
+//tag related
+    } else if (ntokens >= 4 && (strcmp(tokens[COMMAND_TOKEN].value, "tag_add") == 0)) {
+
+        process_tag_add_command(c, tokens, ntokens);
+
+    } else if (ntokens == 3 && (strcmp(tokens[COMMAND_TOKEN].value, "tag_delete") == 0)) {
+
+        process_tag_delete_command(c, tokens, ntokens);
+
+    } else if (ntokens >= 3 && (strcmp(tokens[COMMAND_TOKEN].value, "tags_delete") == 0)) {
+
+        process_tags_delete_command(c, tokens, ntokens);
+
+//tag related
     } else {
         out_string(c, "ERROR");
     }
@@ -3018,6 +3217,7 @@ int main (int argc, char **argv) {
     stats_init();
     assoc_init();
     conn_init();
+    tag_init();  //tag related
     /* Hacky suffix buffers. */
     suffix_init();
     slabs_init(settings.maxbytes, settings.factor, preallocate);

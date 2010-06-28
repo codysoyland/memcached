@@ -1,3 +1,11 @@
+* This is modified version of memcached 1.2.8
+new functions: 
+tag_add <tag> <key> - adds tag for the key 
+tag_delete <tag> - deletes all keys with given tag 
+tags_delete <tag1> <tag2> ... - deletes keys which have set of all given tags 
+any questions with regards to new functionality please email: eugen.e.bragin+memd@gmail.com
+Eugene Bragin
+
 Dependencies:
 
    -- libevent, http://www.monkey.org/~provos/libevent/ (libevent-dev)
